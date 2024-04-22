@@ -1,0 +1,267 @@
+import math
+import os
+from pathlib import Path # type: ignore
+from typing import Optional # type: ignore
+
+import numpy as np
+import torch
+from gym import spaces
+import sys
+import gym
+
+from omni.isaac.core.tasks import BaseTask
+from omni.isaac.core.scenes.scene import Scene
+from omni.isaac.core.objects import VisualCuboid, DynamicCuboid, FixedCuboid
+
+from omni.isaac.core.utils.prims import create_prim, define_prim, delete_prim
+from omni.isaac.core.articulations import ArticulationView
+
+ALOHA_ASSET_PATH = (
+    Path.home()
+    / ".local/share/ov/pkg/isaac_sim-2022.2.1/standalone_examples/aloha-tdmpc/assets/ALOHA.usd"
+).as_posix()
+
+
+## Visual Cube: 0.8, 0.2, 0.8
+## Table: 0.9, 0.0, 0.3 
+## Cube: 0.7, -0.1, 0.8
+
+class AlohaTask(BaseTask):
+    def __init__(self, 
+        name: str,
+        n_envs: int = 1,
+        offset: Optional[np.ndarray] = None,
+    ) -> None:
+        self.num_envs = n_envs
+        self.env_spacing = 1.5
+        
+        self.action_space = spaces.Box(low=-1, high=1.0, shape=(7,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=float("inf"), high=float("inf"), shape=(21,), dtype=np.float32)
+        
+        # joint_logic
+        self.current_joint_index = 0
+        self.current_targets = None
+        self.step_size = 0.03
+        self.n_joints = 6  
+
+        # wheels
+        self._wheel_dof_names = ["left_wheel", "right_wheel"]
+        self._num_wheel_dof = len(self._wheel_dof_names)
+        self._wheel_dof_indices: list[int]
+        self.max_velocity = 0.5
+        self.max_angular_velocity = math.pi * 0.5
+
+        # gripper_1
+        self._gripper1_dof_names = ["fl_joint7", "fl_joint8" ]
+        self._num_gripper1_dof = len(self._gripper1_dof_names)
+        self._gripper1_dof_indices: list[int]
+        
+        # gripper_2
+        self._gripper2_dof_names = ["fr_joint7", "fr_joint8" ]
+        self._num_gripper2_dof = len(self._gripper2_dof_names)
+        self._gripper2_dof_indices: list[int]
+        
+        n_arm_dofs = 6
+        
+        # arm_1
+        self._arm1_dof_names = [f"fl_joint{i}" for i in range(1, n_arm_dofs + 1)]
+        self._num_arm1_dof = len(self._arm1_dof_names)
+        self._arm1_dof_indices: list[int]
+        
+        # arm_2
+        self._arm2_dof_names = [f"fr_joint{i}" for i in range(1, n_arm_dofs + 1)]
+        self._num_arm2_dof = len(self._arm2_dof_names)
+        self._arm2_dof_indices: list[int]
+        
+        BaseTask.__init__(self, name=name, offset=offset)
+
+    def set_up_scene(self, scene: Scene) -> None:
+        self.all_cubes = []
+        
+        table_height = 0.7
+        cube_size = 0.05
+        self.cube_default_translation = np.array([0.7, 0.2, table_height + cube_size / 2])
+        
+        for scene_id in range(self.num_envs):
+            scene_prim_path = f"/World/scene_{scene_id}"
+            create_prim(
+                prim_path=scene_prim_path,
+                position=(0, 0 + 3 * scene_id, 0)
+            )
+            
+            # adding robot
+            create_prim(
+                prim_path=f"{scene_prim_path}/aloha",
+                translation=(0,0,0),
+                usd_path=ALOHA_ASSET_PATH
+            )
+            
+            # adding table
+            table = scene.add(
+                FixedCuboid(
+                    prim_path=f"{scene_prim_path}/table",
+                    name=f"table_{scene_id}",
+                    translation=np.array([0.9, 0.0, table_height / 2]),
+                    size=table_height,
+                    color=np.array([0, 0, 1.0]),
+                )
+            )
+            
+            # adding cube
+            cube = scene.add(
+                DynamicCuboid(
+                    prim_path=f"{scene_prim_path}/cube",
+                    name=f"visual_cube_{scene_id}",
+                    translation=self.cube_default_translation,
+                    size=cube_size,
+                    color=np.array([1.0, 0, 0]),
+                )
+            )
+            self.all_cubes.append(cube)
+            
+        
+        self.robots = ArticulationView(
+            prim_paths_expr=f"/World/scene_*/aloha",
+            name="aloha_view"
+        )
+        self.cubes = ArticulationView(
+            prim_paths_expr=f"/World/scene_*/cube",
+            name="cube_view"
+        )
+        self.tables = ArticulationView(
+            prim_paths_expr=f"/World/scene_*/table",
+            name="table_view"
+        )
+
+        scene.add_default_ground_plane()
+        scene.add(self.robots)
+    
+    def reset(self, env_ids=None):
+        self.robots.set_joint_positions(self.default_robot_joint_positions)
+        
+        from omni.isaac.dynamic_control import _dynamic_control
+        dc = _dynamic_control.acquire_dynamic_control_interface()
+        for i in range(self.num_envs):
+            articulation = dc.get_articulation(f"/World/scene_{i}/aloha")
+            root_body = dc.get_articulation_root_body(articulation)
+            dc.wake_up_articulation(articulation)
+            tf = _dynamic_control.Transform()
+            tf.p = (0,3*i,0)
+            dc.set_rigid_body_pose(root_body, tf)
+            
+            t = self.cube_default_translation.copy()
+            t[1] += 3 * i
+            self.all_cubes[i].set_local_pose(translation=t)
+
+            
+        
+    def post_reset(self) -> None:
+        self._wheel_dof_indices = [
+            self.robots.get_dof_index(self._wheel_dof_names[i]) for i in range(self._num_wheel_dof)
+        ]
+        self._gripper1_dof_indices = [
+            self.robots.get_dof_index(self._gripper1_dof_names[i]) for i in range(self._num_gripper1_dof)
+        ]
+        self._gripper2_dof_indices = [
+            self.robots.get_dof_index(self._gripper2_dof_names[i]) for i in range(self._num_gripper2_dof)
+        ]
+        self._arm1_dof_indices = [
+            self.robots.get_dof_index(self._arm1_dof_names[i]) for i in range(self._num_arm1_dof)
+        ]
+        self._arm2_dof_indices = [
+            self.robots.get_dof_index(self._arm2_dof_names[i]) for i in range(self._num_arm2_dof)
+        ]
+        self.default_robot_joint_positions = self.robots.get_joint_positions()
+    
+
+    def get_observations(self) -> dict:
+        """
+        Construct observation tensor with the following components:
+        - Gripper joint positions (2)
+        - Arm joint positions (6)
+        - Arm joint velocities (6)
+        - Cube position (3)
+        - Cube orientation (4)
+        """
+        
+        grip_1_jpos = self.robots.get_joint_positions(joint_indices=self._gripper1_dof_indices)
+        arm_1_jpos = self.robots.get_joint_positions(joint_indices=self._arm1_dof_indices)
+        arm_1_jvel = self.robots.get_joint_velocities(joint_indices=self._arm1_dof_indices)
+
+        cube_pos, cube_quat = self.cubes.get_local_poses()
+
+        
+        self.obs = torch.cat(
+            [   
+                grip_1_jpos,
+                arm_1_jpos,
+                arm_1_jvel,
+                cube_pos,
+                cube_quat,
+
+            ],
+            axis=-1
+        )
+        return self.obs
+    
+    def calculate_metrics(self) -> dict:
+        cube_height = 0.05  # Example value; adjust as needed
+
+        # Index for cube's z-coordinate (3 positions + 4 orientations = last 7, z is the first of these)
+        cube_vertical_center = self.obs[:, -7 + 2]  # Adjust index accordingly
+        
+        # Calculate cube's bottom surface z-position
+        cube_bottom_surface = cube_vertical_center - (cube_height / 2)
+        
+        # Table top surface z-position (assuming table height is set correctly)
+        table_top_surface = 0.7
+        
+        # Calculate vertical distance
+        vertical_distance = cube_bottom_surface - table_top_surface
+
+        # Reward for lifting the cube
+        rewards = vertical_distance  # More height, better reward
+        
+        return torch.as_tensor(rewards, dtype=torch.float32)
+    
+
+    def is_done(self) -> bool:
+        dones = torch.tensor([False] * self.num_envs, dtype=bool)
+        return dones
+
+    def pre_physics_step(self, actions):
+        actions = torch.as_tensor(actions, dtype=torch.float32)
+
+        # Ensure actions are at least 2-dimensional
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(0)  # Add batch dimension if it's not present
+
+        # Initialize target positions if not set
+        if self.current_targets is None:
+            self.current_targets = self.robots.get_joint_positions(joint_indices=self._arm1_dof_indices)[0].clone()
+
+        # Control gripper1
+        cmd = actions[:, 0]  # gripper: 1 to open, -1 to close
+        cmd = torch.clip(cmd, min=-1.0, max=1.0) / 50
+        jpos = torch.stack([cmd, cmd], axis=-1)
+        self.robots.set_joint_position_targets(jpos, joint_indices=self._gripper1_dof_indices)
+
+        # Move the current joint towards its target
+        joint_pos = self.current_targets[self.current_joint_index]
+        target_pos = actions[0, self.current_joint_index + 1] * 0.1  # scale the input appropriately
+        # Calculate new position trying to move towards the target by step size
+        if joint_pos < target_pos:
+            joint_pos = min(joint_pos + self.step_size, target_pos)
+        else:
+            joint_pos = max(joint_pos - self.step_size, target_pos)
+        self.current_targets[self.current_joint_index] = joint_pos
+
+        # Set the new position for the current joint
+        joint_positions = self.robots.get_joint_positions(joint_indices=self._arm1_dof_indices)[0]
+        joint_positions[self.current_joint_index] = joint_pos
+        self.robots.set_joint_positions(joint_positions, joint_indices=self._arm1_dof_indices)
+
+        # Update the index for the next step, reset if at the last joint
+        self.current_joint_index = (self.current_joint_index + 1) % self.n_joints
+
+
